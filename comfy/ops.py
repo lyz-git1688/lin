@@ -460,6 +460,11 @@ def uncast_bias_weight(s, weight, bias, offload_stream):
                 return
             device = bias_a.device
     os.wait_stream(comfy.model_management.current_stream(device))
+    for tensor in (weight_a, bias_a):
+        if isinstance(tensor, QuantizedTensor):
+            tensor = tensor._qdata
+        if isinstance(tensor, torch.Tensor):
+            comfy.model_management.release_cast_buffer(os, tensor)
 
 class CastBiasWeightContext:
     # When initialized with no arguments or the first is None, the context
