@@ -110,6 +110,13 @@ class _ScanState:
     hash_failed: int = 0
     enrich_failed: int = 0
     permission_denied: int = 0
+    # Directories the input/output walks listed; the models listing is not counted.
+    dirs_listed: int = 0
+    # os.stat calls on files in the reference sync, discovery, admission, seed, watch-list
+    # and enrich loops. Hashing's own stability stats are not counted.
+    files_statted: int = 0
+    # Time blocked at the pause gate.
+    paused_s: float = 0.0
     cancel_stage: str | None = None
     _emitted_keys: set[str] = field(default_factory=set)
 
@@ -534,7 +541,12 @@ class _AssetSeeder:
         """
         if not self._run_gate.is_set():
             self._emit_event("assets.seed.paused", {})
-        self._run_gate.wait()  # Blocks if paused
+        # Re-checked so a pause landing just after the check above still blocks, and is timed.
+        if not self._run_gate.is_set():
+            t_paused = time.perf_counter()
+            self._run_gate.wait()  # Blocks until resume or cancel
+            if self._scan_state is not None:
+                self._scan_state.paused_s += time.perf_counter() - t_paused
         cancelled = self._is_cancelled()
         if cancelled:
             self._record_cancel_stage(stage)
@@ -606,6 +618,8 @@ class _AssetSeeder:
     def _run_scan(self) -> None:
         """Main scan loop running in background thread."""
         t_start = time.perf_counter()
+        # Per-thread CPU clock on Windows, macOS and Linux; excludes time blocked while paused.
+        cpu_start = time.thread_time()
         roots = self._roots
         phase = self._phase
         root = roots[0] if len(roots) == 1 else None
@@ -703,6 +717,7 @@ class _AssetSeeder:
                 return
 
             elapsed = time.perf_counter() - t_start
+            cpu = time.thread_time() - cpu_start
             logging.info(
                 "Scan(%s, %s) done %.3fs: created=%d enriched=%d skipped=%d",
                 roots,
@@ -716,6 +731,10 @@ class _AssetSeeder:
                 "seeder.scan_completed",
                 phase=phase.value,
                 elapsed_ms=round(elapsed * 1000),
+                cpu_ms=round(cpu * 1000),
+                paused_ms=round(scan_state.paused_s * 1000),
+                dirs_listed_count=scan_state.dirs_listed,
+                files_statted_count=scan_state.files_statted,
                 created=total_created,
                 enriched=total_enriched,
                 skipped=skipped_existing,
@@ -814,7 +833,7 @@ class _AssetSeeder:
             return total_created, skipped_existing, 0
 
         t_collect = time.perf_counter()
-        paths = collect_paths_for_roots(roots)
+        paths = collect_paths_for_roots(roots, scan_state)
         logging.debug(
             "Fast scan: collect_paths took %.3fs (%d paths found)",
             time.perf_counter() - t_collect,
@@ -865,7 +884,7 @@ class _AssetSeeder:
             batch_tags = {t for spec in batch for t in spec["tags"]}
             created = 0
             try:
-                created, batch_error = insert_asset_specs(batch, batch_tags)
+                created, batch_error = insert_asset_specs(batch, batch_tags, scan_state)
                 total_created += created
                 if batch_error is not None:
                     raise batch_error
@@ -902,7 +921,7 @@ class _AssetSeeder:
                 last_progress_time = now
 
         self._update_progress(scanned=len(specs), created=total_created)
-        tick_watch_list()
+        tick_watch_list(scan_state)
         logging.info(
             "Fast scan complete: %.3fs total (created=%d, skipped=%d, total_paths=%d)",
             time.perf_counter() - t_fast_start,
@@ -923,7 +942,7 @@ class _AssetSeeder:
         with create_session() as session:
             drain_pending_verifications(session)
             session.commit()
-            tick_watch_list()
+            tick_watch_list(scan_state)
             for _ in range(3):
                 drain_transition_queue(session)
                 session.commit()
